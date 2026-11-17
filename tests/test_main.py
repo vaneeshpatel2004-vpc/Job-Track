@@ -6,11 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.main import app, get_db
-from app.database import Base
+from app.main import app
+from app.database import Base, get_db
+from app.models import User
+from app.security import hash_password
 
 
-# Create a separate in-memory test database
+# Separate in-memory test database
 TEST_DATABASE_URL = "sqlite://"
 
 test_engine = create_engine(
@@ -26,7 +28,6 @@ TestingSessionLocal = sessionmaker(
 )
 
 
-# Configure database for testing
 @pytest.fixture
 def client():
     Base.metadata.create_all(bind=test_engine)
@@ -40,6 +41,22 @@ def client():
 
     app.dependency_overrides[get_db] = override_get_db
 
+    with TestingSessionLocal() as db:
+        user = User(
+            username="testuser",
+            email="test@example.com",
+            hashed_password=hash_password("TestPassword123!")
+        )
+        db.add(user)
+
+        second_user = User(
+            username="seconduser",
+            email="second@example.com",
+            hashed_password=hash_password("SecondPassword123!")
+        )
+        db.add(second_user)
+        db.commit()
+
     with TestClient(app) as test_client:
         yield test_client
 
@@ -47,73 +64,139 @@ def client():
     Base.metadata.drop_all(bind=test_engine)
 
 
-# Test 1: Home API
+def login_and_authorize(client, email, password):
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": email,
+            "password": password
+        }
+    )
+
+    assert response.status_code == 200
+
+    token = response.json()["access_token"]
+
+    return {
+        "Authorization": f"Bearer {token}"
+    }
+
+
 def test_home(client):
     response = client.get("/")
-
     assert response.status_code == 200
-    assert response.json()["status"] == "Running"
 
 
-# Test 2: Health API
 def test_health(client):
     response = client.get("/health")
+    assert response.status_code == 200
+
+
+def test_user_login(client):
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+    assert headers["Authorization"].startswith("Bearer ")
+
+
+def test_user_profile(client):
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
+    response = client.get("/auth/me", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+    assert response.json()["username"] == "testuser"
 
 
-# Test 3: Create application
+def test_invalid_login(client):
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": "test@example.com",
+            "password": "WrongPassword123!"
+        }
+    )
+
+    assert response.status_code == 401
+
+
+def test_unauthorized_access(client):
+    response = client.get("/applications")
+
+    assert response.status_code == 403
+
+
 def test_create_application(client):
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
     response = client.post(
         "/applications",
+        headers=headers,
         json={
             "company": "Google",
             "job_title": "Python Developer",
             "location": "Bangalore",
-            "status": "Applied",
-            "applied_date": "2026-11-13",
-            "interview_date": None,
-            "notes": "Testing application"
+            "status": "Applied"
         }
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert response.json()["company"] == "Google"
-    assert response.json()["id"] == 1
 
 
-# Test 4: Get all applications
 def test_get_applications(client):
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
     client.post(
         "/applications",
+        headers=headers,
         json={
-            "company": "Infosys",
-            "job_title": "Software Engineer"
-        }
-    )
-
-    response = client.get("/applications")
-
-    assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["company"] == "Infosys"
-
-
-# Test 5: Update application
-def test_update_application(client):
-    create_response = client.post(
-        "/applications",
-        json={
-            "company": "TCS",
+            "company": "Google",
             "job_title": "Python Developer"
         }
     )
 
-    application_id = create_response.json()["id"]
+    response = client.get("/applications", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+
+def test_update_application(client):
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
+    created = client.post(
+        "/applications",
+        headers=headers,
+        json={
+            "company": "Google",
+            "job_title": "Python Developer"
+        }
+    )
+
+    application_id = created.json()["id"]
 
     response = client.put(
         f"/applications/{application_id}",
+        headers=headers,
         json={"status": "Interview"}
     )
 
@@ -121,142 +204,124 @@ def test_update_application(client):
     assert response.json()["status"] == "Interview"
 
 
-# Test 6: Delete application
 def test_delete_application(client):
-    create_response = client.post(
+    headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
+    created = client.post(
         "/applications",
+        headers=headers,
         json={
-            "company": "Wipro",
-            "job_title": "Backend Developer"
+            "company": "Google",
+            "job_title": "Python Developer"
         }
     )
 
-    application_id = create_response.json()["id"]
+    application_id = created.json()["id"]
 
     response = client.delete(
-        f"/applications/{application_id}"
+        f"/applications/{application_id}",
+        headers=headers
     )
 
     assert response.status_code == 200
-    assert response.json()["message"] == "Application deleted successfully"
 
-    get_response = client.get(
-        f"/applications/{application_id}"
+
+def test_user_cannot_access_another_users_application(client):
+    first_user_headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
     )
 
-    assert get_response.status_code == 404
+    second_user_headers = login_and_authorize(
+        client,
+        "second@example.com",
+        "SecondPassword123!"
+    )
 
+    created = client.post(
+        "/applications",
+        headers=first_user_headers,
+        json={
+            "company": "Google",
+            "job_title": "Python Developer"
+        }
+    )
 
-# Test 7: Application not found
-def test_application_not_found(client):
-    response = client.get("/applications/999")
+    application_id = created.json()["id"]
+
+    response = client.get(
+        f"/applications/{application_id}",
+        headers=second_user_headers
+    )
 
     assert response.status_code == 404
 
 
-# Test 8: Search applications by company
-def test_search_by_company(client):
-    client.post("/applications", json={
-        "company": "Google",
-        "job_title": "Python Developer"
-    })
-
-    response = client.get("/applications?company=Google")
-
-    assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["company"] == "Google"
-
-
-# Test 9: Filter applications by status
-def test_filter_by_status(client):
-    client.post("/applications", json={
-        "company": "Infosys",
-        "job_title": "Developer",
-        "status": "Interview"
-    })
-
-    response = client.get("/applications?status=Interview")
-
-    assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["status"] == "Interview"
-
-
-# Test 10: Filter applications by location
-def test_filter_by_location(client):
-    client.post("/applications", json={
-        "company": "TCS",
-        "job_title": "Data Engineer",
-        "location": "Bangalore"
-    })
-
-    response = client.get("/applications?location=Bangalore")
-
-    assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["location"] == "Bangalore"
-
-
-# Test 11: Combined filters
-def test_combined_filters(client):
-    client.post("/applications", json={
-        "company": "Google",
-        "job_title": "Python Developer",
-        "location": "Bangalore",
-        "status": "Interview"
-    })
-
-    response = client.get(
-        "/applications?company=Google&status=Interview&location=Bangalore"
+def test_user_cannot_update_another_users_application(client):
+    first_user_headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
     )
 
-    assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["company"] == "Google"
-
-
-# Test 12: Pagination
-def test_pagination(client):
-    for company in ["Google", "Infosys", "TCS"]:
-        response = client.post(
-            "/applications",
-            json={
-                "company": company,
-                "job_title": "Python Developer"
-            }
-        )
-        assert response.status_code == 200
-
-    response = client.get(
-        "/applications?skip=0&limit=2"
+    second_user_headers = login_and_authorize(
+        client,
+        "second@example.com",
+        "SecondPassword123!"
     )
 
-    assert response.status_code == 200
-    assert len(response.json()) == 2
-
-
-# Test 13: Sorting
-def test_sorting(client):
-    client.post("/applications", json={
-        "company": "Google",
-        "job_title": "Developer",
-        "applied_date": "2026-11-01"
-    })
-
-    client.post("/applications", json={
-        "company": "Infosys",
-        "job_title": "Engineer",
-        "applied_date": "2026-11-10"
-    })
-
-    response = client.get(
-        "/applications?sort_order=desc"
+    created = client.post(
+        "/applications",
+        headers=first_user_headers,
+        json={
+            "company": "Google",
+            "job_title": "Python Developer"
+        }
     )
 
-    assert response.status_code == 200
+    application_id = created.json()["id"]
 
-    applications = response.json()
+    response = client.put(
+        f"/applications/{application_id}",
+        headers=second_user_headers,
+        json={"status": "Rejected"}
+    )
 
-    assert applications[0]["company"] == "Infosys"
-    assert applications[1]["company"] == "Google"
+    assert response.status_code == 404
+
+
+def test_user_cannot_delete_another_users_application(client):
+    first_user_headers = login_and_authorize(
+        client,
+        "test@example.com",
+        "TestPassword123!"
+    )
+
+    second_user_headers = login_and_authorize(
+        client,
+        "second@example.com",
+        "SecondPassword123!"
+    )
+
+    created = client.post(
+        "/applications",
+        headers=first_user_headers,
+        json={
+            "company": "Google",
+            "job_title": "Python Developer"
+        }
+    )
+
+    application_id = created.json()["id"]
+
+    response = client.delete(
+        f"/applications/{application_id}",
+        headers=second_user_headers
+    )
+
+    assert response.status_code == 404

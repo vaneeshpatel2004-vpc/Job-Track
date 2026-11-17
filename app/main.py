@@ -1,48 +1,72 @@
 
-from fastapi import FastAPI, Depends, HTTPException
+from typing import Optional
+
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Query,
+    status
+)
 from sqlalchemy.orm import Session
 
-from app.database import engine, Base, SessionLocal
+from app.database import engine, Base, get_db
 from app import models, schemas
+from app.auth import router as auth_router, get_current_user
 
+
+# Create database tables
 Base.metadata.create_all(bind=engine)
 
+
+# Initialize FastAPI
 app = FastAPI(
     title="JobTrack API",
-    description="Job Application Management System",
-    version="1.0.0"
+    description="Job Application Management System with JWT Authentication",
+    version="2.0.0"
 )
 
 
-# Database dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Register authentication routes
+app.include_router(auth_router)
 
+
+# --------------------------------------------------
+# HOME AND HEALTH CHECK
+# --------------------------------------------------
 
 @app.get("/")
 def home():
     return {
-        "message": "Welcome to JobTrack!",
-        "status": "Running"
+        "message": "Welcome to JobTrack API"
     }
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy"
+    }
 
 
-# CREATE: Add a job application
-@app.post("/applications", response_model=schemas.JobApplicationResponse)
+# --------------------------------------------------
+# CREATE JOB APPLICATION
+# --------------------------------------------------
+
+@app.post(
+    "/applications",
+    response_model=schemas.JobApplicationResponse,
+    status_code=status.HTTP_201_CREATED
+)
 def create_application(
     application: schemas.JobApplicationCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
-    new_application = models.JobApplication(**application.model_dump())
+    new_application = models.JobApplication(
+        **application.model_dump(),
+        user_id=current_user.id
+    )
 
     db.add(new_application)
     db.commit()
@@ -51,51 +75,46 @@ def create_application(
     return new_application
 
 
+# --------------------------------------------------
+# GET ALL APPLICATIONS BELONGING TO CURRENT USER
+# --------------------------------------------------
 
-from typing import Optional
-from fastapi import Query
-
-@app.get(
-    "/applications",
-    response_model=list[schemas.JobApplicationResponse]
-)
+@app.get("/applications")
 def get_applications(
     company: Optional[str] = None,
-    status: Optional[str] = None,
+    application_status: Optional[str] = Query(
+        default=None,
+        alias="status"
+    ),
     location: Optional[str] = None,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=10, ge=1, le=100),
-    sort_order: str = Query(
-        default="desc",
-        pattern="^(asc|desc)$"
-    ),
-    db: Session = Depends(get_db)
+    sort_order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
-    query = db.query(models.JobApplication)
 
-    # Search by company
+    query = db.query(models.JobApplication).filter(
+        models.JobApplication.user_id == current_user.id
+    )
+
     if company:
         query = query.filter(
-            models.JobApplication.company.ilike(
-                f"%{company}%"
+            models.JobApplication.company.ilike(f"%{company}%")
+        )
+
+    if application_status:
+        query = query.filter(
+            models.JobApplication.status.ilike(
+                f"%{application_status}%"
             )
         )
 
-    # Filter by status
-    if status:
-        query = query.filter(
-            models.JobApplication.status.ilike(status)
-        )
-
-    # Filter by location
     if location:
         query = query.filter(
-            models.JobApplication.location.ilike(
-                f"%{location}%"
-            )
+            models.JobApplication.location.ilike(f"%{location}%")
         )
 
-    # Sort by applied date and ID
     if sort_order == "asc":
         query = query.order_by(
             models.JobApplication.applied_date.asc(),
@@ -107,45 +126,75 @@ def get_applications(
             models.JobApplication.id.desc()
         )
 
-    # Apply pagination
-    return query.offset(skip).limit(limit).all()
+    total = query.count()
+
+    applications = query.offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "applications": applications
+    }
 
 
+# --------------------------------------------------
+# GET SINGLE JOB APPLICATION
+# --------------------------------------------------
 
-
-# READ: Get one job application
-@app.get("/applications/{application_id}", response_model=schemas.JobApplicationResponse)
-def get_application(application_id: int, db: Session = Depends(get_db)):
-    application = db.query(models.JobApplication).filter(
-        models.JobApplication.id == application_id
-    ).first()
-
-    if application is None:
-        raise HTTPException(status_code=404, detail="Application not found")
-
-    return application
-
-# UPDATE: Modify a job application
-@app.put("/applications/{application_id}",
-         response_model=schemas.JobApplicationResponse)
-def update_application(
+@app.get(
+    "/applications/{application_id}",
+    response_model=schemas.JobApplicationResponse
+)
+def get_application(
     application_id: int,
-    updated_data: schemas.JobApplicationUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
+
     application = db.query(models.JobApplication).filter(
-        models.JobApplication.id == application_id
+        models.JobApplication.id == application_id,
+        models.JobApplication.user_id == current_user.id
     ).first()
 
-    if application is None:
+    if not application:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Application not found"
         )
 
-    update_fields = updated_data.model_dump(exclude_unset=True)
+    return application
 
-    for key, value in update_fields.items():
+
+# --------------------------------------------------
+# UPDATE JOB APPLICATION
+# --------------------------------------------------
+
+@app.put(
+    "/applications/{application_id}",
+    response_model=schemas.JobApplicationResponse
+)
+def update_application(
+    application_id: int,
+    application_data: schemas.JobApplicationUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    application = db.query(models.JobApplication).filter(
+        models.JobApplication.id == application_id,
+        models.JobApplication.user_id == current_user.id
+    ).first()
+
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Application not found"
+        )
+
+    update_data = application_data.model_dump(exclude_unset=True)
+
+    for key, value in update_data.items():
         setattr(application, key, value)
 
     db.commit()
@@ -154,19 +203,25 @@ def update_application(
     return application
 
 
-# DELETE: Remove a job application
+# --------------------------------------------------
+# DELETE JOB APPLICATION
+# --------------------------------------------------
+
 @app.delete("/applications/{application_id}")
 def delete_application(
     application_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
+
     application = db.query(models.JobApplication).filter(
-        models.JobApplication.id == application_id
+        models.JobApplication.id == application_id,
+        models.JobApplication.user_id == current_user.id
     ).first()
 
-    if application is None:
+    if not application:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Application not found"
         )
 
@@ -174,5 +229,5 @@ def delete_application(
     db.commit()
 
     return {
-        "message": "Application deleted successfully"
+        "message": "Job application deleted successfully"
     }
